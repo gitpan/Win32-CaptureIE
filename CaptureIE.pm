@@ -19,6 +19,8 @@ our %EXPORT_TAGS = ( 'default' => [ qw(
   CaptureElement
   CapturePage
   CaptureBrowser
+  CaptureRows
+  CaptureThumbshot
 
   $IE
   $Doc
@@ -34,7 +36,7 @@ our @EXPORT_OK = ( @{ $EXPORT_TAGS{'all'} } );
 
 our @EXPORT = @{ $EXPORT_TAGS{'default'} };
 
-our $VERSION = '1.00';
+our $VERSION = '1.10';
 our $IE;
 our $HWND_IE;
 our $HWND_Browser;
@@ -52,12 +54,12 @@ use strict;
 
 ##########################################################################
 
-# HACK: DocumentComplete event is not raised when refreshing page but
-# only DownloadComplete, so if refreshing page we need to wait for
+# HACK: DocumentComplete event is not fired when refreshing page but
+# only DownloadComplete event, so if refreshing page we need to wait for
 # DownloadComplete but not if we are navigating to a page
 our $refreshing_page = 0;
 
-sub StartIE () {
+sub StartIE {
   my %arg = @_;
 
   # Open a new browser window and save its' window handle
@@ -117,9 +119,55 @@ sub GetElement ($) {
   return $Doc->getElementById($_[0]);
 }
 
+
+sub CaptureRows {
+  my $tab = ref $_[0] ? shift : GetElement(shift);
+  my %rows = map {$_ => 1} ref $_[0] ? @{$_[0]} : @_;
+  return undef if $tab->tagName ne 'TABLE' || !%rows;
+
+  my $img;
+  {
+    local @Win32::Screenshot::POST_PROCESS = ();
+    $img = CaptureElement($tab);
+  }
+
+  my $pos = $CaptureBorder + $tab->rows(0)->{offsetTop};
+
+  for ( my $row = 0 ; $row < $tab->rows->{length} ; $row++ ) {
+    if ( $rows{$row} ) {
+      $pos += $tab->rows($row)->{offsetHeight};
+    } else {
+      $img->Chop('x'=>0, 'y'=>$pos, 'width'=>0, 'height'=>$tab->rows($row)->{offsetHeight});
+    }
+  }
+
+  return PostProcessImage( $img );
+}
+
+
+sub CaptureThumbshot {
+
+  # resize the window to set the client area to 800x600
+  $IE->{width} = $IE->{width} + 800-$Body->clientWidth;
+  $IE->{height} = $IE->{height} + 600-$Body->clientHeight;
+
+  # scrollTo(0, 0)
+  $Body->doScroll('pageUp') while $Body->scrollTop > 0;
+  $Body->doScroll('pageLeft') while $Body->scrollLeft > 0;
+
+  return CaptureWindowRect($HWND_Browser, $Body->clientLeft, $Body->clientTop, $Body->clientWidth, $Body->clientHeight );
+}
+
+
 sub CaptureElement {
   my $e = ref $_[0] ? shift : GetElement(shift);
+  my %args = ref $_[0] eq 'HASH' ? %{(shift)} : ();
   return CapturePage() if $e->tagName eq 'BODY';
+
+  $args{border_left} = exists $args{border_left} ? exists $args{border_left} : exists $args{border} ? $args{border} : $CaptureBorder;
+  $args{border_right} = exists $args{border_right} ? exists $args{border_right} : exists $args{border} ? $args{border} : $CaptureBorder;
+  $args{border_top} = exists $args{border_top} ? exists $args{border_top} : exists $args{border} ? $args{border} : $CaptureBorder;
+  $args{border_bottom} = exists $args{border_bottom} ? exists $args{border_bottom} : exists $args{border} ? $args{border} : $CaptureBorder;
 
   my ($px, $py, $sx, $sy, $w, $h);
 
@@ -138,6 +186,11 @@ sub CaptureElement {
     $p = $p->offsetParent;
   }
 
+  $px -= ($args{border_left}||0);
+  $py -= ($args{border_top}||0);
+  $w  += ($args{border_left}||0) + ($args{border_right}||0);
+  $h  += ($args{border_top}||0) + ($args{border_bottom}||0);
+
   # The position on the screen is different due to page scrolling and Body border
   $sx = $px - $Body->scrollLeft + $Body->clientLeft;
   $sy = $py - $Body->scrollTop + $Body->clientTop;
@@ -145,68 +198,21 @@ sub CaptureElement {
   if ( $sx+$w < $Body->clientWidth && $sy+$h < $Body->clientHeight ) {
 
     # If the whole object is visible
-    return CaptureWindowRect($HWND_Browser,
-      $sx-$CaptureBorder,
-      $sy-$CaptureBorder,
-      $w+2*$CaptureBorder,
-      $h+2*$CaptureBorder
-    );
+    return CaptureWindowRect($HWND_Browser, $sx, $sy, $w, $h );
 
   } else {
 
     # If only part of it is visible
-    my (@parts, $pw, $ph, $ch, $cw);
-
-    # We will do the screen capturing in more steps by areas of dimensions $cw x $ch
-    $cw = int($Body->clientWidth * 0.8);
-    $ch = int($Body->clientHeight * 0.8);
-
-    for ( my $cnt_x=0 ; $cnt_x < ceil($w/$cw) ; $cnt_x++ ) {
-
-      $parts[$cnt_x] = '';
-      $e->scrollIntoView(); # go to object starting point
-      $Doc->{parentWindow}->scrollBy($cw*$cnt_x, 0); # go to starting point for this strip
-
-      for ( my $cnt_y=0 ; $cnt_y < ceil($h/$ch) ; $cnt_y++ ) {
-
-        # Recalculate the position on the screen
-        $sx = $px - $Body->scrollLeft + $Body->clientLeft + $cw*$cnt_x;
-        $sy = $py - $Body->scrollTop + $Body->clientTop + $ch*$cnt_y;
-
-        # Calculate the dimensions of the part to be captured
-        $pw = $cw*($cnt_x+1) > $w ? $w - $cw*$cnt_x : $cw;
-        $ph = $ch*($cnt_y+1) > $h ? $h - $ch*$cnt_y : $ch;
-
-        if ( $cnt_x == 0 ) { $pw += $CaptureBorder; $sx -= $CaptureBorder; }
-        if ( $cnt_y == 0 ) { $ph += $CaptureBorder; $sy -= $CaptureBorder; }
-        if ( $cnt_x == floor($w/$cw) ) { $pw += $CaptureBorder; }
-        if ( $cnt_y == floor($h/$ch) ) { $ph += $CaptureBorder; }
-
-        # Capture the part and append it to the strip
-        $parts[$cnt_x] .= (CaptureHwndRect($HWND_Browser, $sx, $sy, $pw, $ph))[2];
-
-        $Doc->{parentWindow}->scrollBy(0, $ch);
-      }
-    }
-
-    # join the strips into one big bitmap
-    my $bw = $cw + $CaptureBorder; # width of the big bitmap
-    for ( my $cnt_x=1 ; $cnt_x < ceil($w/$cw) ; $cnt_x++ ) {
-      $pw = $cw*($cnt_x+1) > $w ? $w - $cw*$cnt_x + $CaptureBorder : $cw; # width of the part
-      $parts[0] = JoinRawData( $bw, $pw, $h, $parts[0], $parts[$cnt_x] );
-      $bw += $pw;
-    }
-
-    return CreateImage( $w+2*$CaptureBorder, $h+2*$CaptureBorder, $parts[0] );
+    return CaptureAndScroll($e, $px, $py, $w, $h);
   }
 }
-
 
 sub CapturePage {
   my ($px, $py, $sx, $sy, $w, $h);
 
   # Scrolls the object so that top of the object is visible at the top of the window.
-  $Doc->{parentWindow}->scrollTo(0, 0);
+  $Body->doScroll('pageUp') while $Body->scrollTop > 0;
+  $Body->doScroll('pageLeft') while $Body->scrollLeft > 0;
 
   # This is the size of the page content
   $w = $Body->scrollWidth;
@@ -227,45 +233,74 @@ sub CapturePage {
   } else {
 
     # If only part of it is visible
-    my (@parts, $pw, $ph, $ch, $cw);
-
-    # We will do the screen capturing in more steps by areas of dimensions $cw x $ch
-    $cw = int($Body->clientWidth * 0.8);
-    $ch = int($Body->clientHeight * 0.8);
-
-    for ( my $cnt_x=0 ; $cnt_x < ceil($w/$cw) ; $cnt_x++ ) {
-      $parts[$cnt_x] = '';
-      for ( my $cnt_y=0 ; $cnt_y < ceil($h/$ch) ; $cnt_y++ ) {
-
-        $Doc->{parentWindow}->scrollTo($cw*$cnt_x, $ch*$cnt_y);
-
-        # Recalculate the position on the screen
-        $sx = $px - $Body->scrollLeft + $Body->clientLeft + $cw*$cnt_x;
-        $sy = $py - $Body->scrollTop + $Body->clientTop + $ch*$cnt_y;
-
-        # Calculate the dimensions of the part to be captured
-        $pw = $cw*($cnt_x+1) > $w ? $w - $cw*$cnt_x : $cw;
-        $ph = $ch*($cnt_y+1) > $h ? $h - $ch*$cnt_y : $ch;
-
-        # Capture the part and append it to the strip
-        $parts[$cnt_x] .= (CaptureHwndRect($HWND_Browser, $sx, $sy, $pw, $ph))[2];
-      }
-    }
-
-    # join the strips into one big bitmap
-    my $bw = $cw; # width of the big bitmap
-    for ( my $cnt_x=1 ; $cnt_x < ceil($w/$cw) ; $cnt_x++ ) {
-      $pw = $cw*($cnt_x+1) > $w ? $w - $cw*$cnt_x : $cw; # width of the part
-      $parts[0] = JoinRawData( $bw, $pw, $h, $parts[0], $parts[$cnt_x] );
-      $bw += $pw;
-    }
-
-    return CreateImage( $w, $h, $parts[0] );
+    return CaptureAndScroll(undef, $px, $py, $w, $h);
   }
 }
 
+sub CaptureAndScroll {
+  my ($e, $px, $py, $w, $h) = @_;
+  my ($strip, $final, $pw, $ph, $ch, $cw, $maxw, $maxh, $sx, $sy);
+
+  $final = '';
+
+  # Captured area
+  $cw = 0;
+  $ch = 0;
+
+  # We will do the screen capturing in more steps by areas of maximum dimensions $cw x $ch
+  $maxw = $Body->clientWidth;
+  $maxh = $Body->clientHeight;
+
+  for ( my $cnt_x=0 ; $cw < $w ; $cnt_x++ ) {
+
+    # Scroll to the top and one right
+    if ( $e ) {
+      $e->scrollIntoView;
+      $Body->doScroll('pageRight') for 1..$cnt_x;
+    } else {
+      $Body->doScroll('pageUp') while $Body->scrollTop > 0;
+      $Body->doScroll('pageRight') if $cnt_x;
+    }
+
+    $strip = '';
+    $ch = 0;
+
+    for ( my $cnt_y=0 ; $ch < $h ; $cnt_y++ ) {
+
+      $Body->doScroll('pageDown') if $cnt_y;
+
+      # Recalculate the position on the screen
+      $sx = $px - $Body->scrollLeft + $Body->clientLeft + $cw;
+      $sy = $py - $Body->scrollTop + $Body->clientTop + $ch;
+
+      # Calculate the dimensions of the part to be captured
+      $pw = ($px+$cw) - $Body->scrollLeft + $maxw > $maxw ? $maxw - ($px+$cw) + $Body->scrollLeft : $maxw;
+      $pw = $cw + $pw > $w ? $w - $cw : $pw;
+
+      $ph = ($py+$ch) - $Body->scrollTop + $maxh > $maxh ? $maxh - ($py+$ch) + $Body->scrollTop : $maxh;
+      $ph = $ch + $ph > $h ? $h - $ch : $ph;
+
+      # Capture the part and append it to the strip
+      $strip .= (CaptureHwndRect($HWND_Browser, $sx, $sy, $pw, $ph))[2];
+
+      $ch += $ph;
+    }
+
+    $final = JoinRawData( $cw, $pw, $h, $final, $strip );
+
+    $cw += $pw;
+  }
+
+  return CreateImage( $w, $h, $final );
+}
+
+
 sub CaptureBrowser {
-  $Doc->{parentWindow}->scrollTo(0, 0);
+
+  # scrollTo(0, 0)
+  $Body->doScroll('pageUp') while $Body->scrollTop > 0;
+  $Body->doScroll('pageLeft') while $Body->scrollLeft > 0;
+
   return CaptureWindow( $HWND_IE );
 }
 
@@ -323,7 +358,9 @@ screenshots and glue the parts together.
 
 C<CaptureBrowser>
 C<CaptureElement>
+C<CaptureRows>
 C<CapturePage>
+C<CaptureThumbshot>
 C<GetDoc>
 C<GetElement>
 C<Navigate>
@@ -392,15 +429,35 @@ Captures whole page currently loaded in the Internet Explorer window. Only the p
 be captured - no window, no scrollbars. If the page is smaller than the window only the occupied
 part of the window will be captured. If the page is longer (scrollbars are active) the function
 will capture the whole page step by step by scrolling the window content (in all directions) and
-will return an complete image of the page.
+will return a complete image of the page.
 
-=item CaptureElement ( $id | $element )
+=item CaptureElement ( $id | $element [, \%args ] )
 
 Captures the element specified by its ID or passed as reference to the
-element object. It will capture a small border around the element
-specified by C<$CaptureBorder> global variable. The function will
-scroll the page content to show the top of the element and scroll down
-and right step by step to get whole area occupied by the object.
+element object. The function will scroll the page content to show the top
+of the element and scroll down and right step by step to get whole area
+occupied by the object.
+
+It can capture a small surrounding area around the element specified
+by %args hash or C<$CaptureBorder> global variable. It recognizes paramters
+C<border>, C<border-left>, C<border-top>, C<border-right> and C<border-bottom>.
+The priority is C<border-*> -> C<border> -> C<$CaptureBorder>.
+
+=item CaptureRows ( $id | $element , @rows )
+
+Captures the table specified by its ID or passed as reference to the
+table object. The function will scroll the page content to show the top
+of the table and scroll down and right step by step to get whole area
+occupied by the table. Than it will chop unwanted rows from the image and it will
+return the image of table containing only selected rows. Rows are numbered from zero.
+
+It can capture a small surrounding area around the element specified
+by C<$CaptureBorder> global variable.
+
+=item CaptureThumbshot ( )
+
+Resizes the window to set the client area to 800x600 pixels. Captures the client
+area where the page is rendered. No scrolling is done.
 
 =back
 
@@ -445,20 +502,6 @@ convert page coordinates to screen coordinates.
 
 =back
 
-=head1 BUGS
-
-=over 8
-
-=item * Access denied
-
-Sometimes I receive the error message 'Access denied' when accessing
-C<< $Doc->{parentWindow} >> properties and methods (C<scrollBy> and
-C<scrollTo> methods are called from the package functions). Sometimes
-I have to close all running IE windows or restart computer if it's not
-enough to solve the problem. I will appreciate any help.
-
-=back
-
 =head1 SEE ALSO
 
 =item MSDN
@@ -482,6 +525,5 @@ Copyright (C) 2004 by P.Smejkal
 This library is free software; you can redistribute it and/or modify
 it under the same terms as Perl itself, either Perl version 5.8.2 or,
 at your option, any later version of Perl 5 you may have available.
-
 
 =cut

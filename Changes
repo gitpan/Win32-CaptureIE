@@ -2,3 +2,9 @@ Revision history for Perl extension Win32::CaptureIE.
 
 1.00  Sun Jan 25 23:40:39 2004
 	- original version
+
+1.10  Tue Feb 17 15:37:23 2004
+        - fix: the window object is no more required, scrolling is done in different way
+        - new: CaptureRows function
+        - new: CaptureThumbshot function
+        - new: advanced customization of border for CaptureElement function

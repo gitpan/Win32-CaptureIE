@@ -7,7 +7,7 @@ WriteMakefile(
     VERSION_FROM      => 'CaptureIE.pm', # finds $VERSION
     PREREQ_PM         => {
       Image::Magick	=> 0,
-      Win32::Screenshot	=> 0,
+      Win32::Screenshot	=> 1.10,
       Win32::OLE	=> 0,
     }, # e.g., Module::Name => 1.1
     ($] >= 5.005 ?     ## Add these new keywords supported since 5.005
