@@ -14,13 +14,16 @@ our %EXPORT_TAGS = ( 'default' => [ qw(
   Navigate
   Refresh
   GetElement
+  GetAll
   GetDoc
 
   CaptureElement
+  CaptureElements
   CapturePage
   CaptureBrowser
   CaptureRows
   CaptureThumbshot
+  CaptureArea
 
   $IE
   $Doc
@@ -36,12 +39,13 @@ our @EXPORT_OK = ( @{ $EXPORT_TAGS{'all'} } );
 
 our @EXPORT = @{ $EXPORT_TAGS{'default'} };
 
-our $VERSION = '1.11';
+our $VERSION = '1.20';
 our $IE;
 our $HWND_IE;
 our $HWND_Browser;
 our $Doc;
 our $Body;
+our ($MOUSE_x, $MOUSE_y);
 
 our $CaptureBorder = 1;
 
@@ -90,11 +94,16 @@ sub StartIE {
     }
   }
   $HWND_Browser = $i;
+
+  ($MOUSE_x, $MOUSE_y) = GetCursorPos();
+  SetCursorPos(0, 0);
 }
 
 sub QuitIE () {
   $IE->Quit();
   $IE = undef;
+
+  SetCursorPos($MOUSE_x, $MOUSE_y);
 }
 
 sub Navigate ($) {
@@ -119,31 +128,46 @@ sub GetElement ($) {
   return $Doc->getElementById($_[0]);
 }
 
+sub GetAll ($;$) {
+  my $tag = uc shift;
+  my $idx = shift;
+  my @elements;
+
+  for ( my $i = 0 ; $i < $Doc->All->length ; $i++ ) {
+    push @elements, $Doc->All($i) if $Doc->All($i)->tagName eq $tag;
+    last if defined $idx && @elements > $idx;
+  }
+
+  return defined $idx ? $elements[$idx] : @elements;
+}
+
+#####################################################################
 
 sub CaptureRows {
   my $tab = ref $_[0] ? shift : GetElement(shift);
   my %rows = map {$_ => 1} ref $_[0] ? @{$_[0]} : @_;
   return undef if $tab->tagName ne 'TABLE' || !%rows;
 
+  # temporary disable post processing
   my $img;
   {
     local @Win32::Screenshot::POST_PROCESS = ();
     $img = CaptureElement($tab);
   }
 
+  # skip over CaptureBorder and table border (start on top of 1st row)
   my $pos = $CaptureBorder + $tab->rows(0)->{offsetTop};
 
   for ( my $row = 0 ; $row < $tab->rows->{length} ; $row++ ) {
-    if ( $rows{$row} ) {
+    if ( $rows{$row} ) { # we want this row,  skip over it
       $pos += $tab->rows($row)->{offsetHeight};
-    } else {
+    } else { # don't want this one, chop it out of the picture
       $img->Chop('x'=>0, 'y'=>$pos, 'width'=>0, 'height'=>$tab->rows($row)->{offsetHeight});
     }
   }
 
   return PostProcessImage( $img );
 }
-
 
 sub CaptureThumbshot {
 
@@ -154,33 +178,23 @@ sub CaptureThumbshot {
   $IE->{height} = $IE->{height} + 600-$Body->clientHeight;
 
   # scrollTo(0, 0)
-  $Body->doScroll('pageUp') while $Body->scrollTop > 0;
-  $Body->doScroll('pageLeft') while $Body->scrollLeft > 0;
-
+  $Body->{scrollTop} = 0;
+  $Body->{scrollLeft} = 0;
   Win32::OLE->SpinMessageLoop();
 
   return CaptureWindowRect($HWND_Browser, $Body->clientLeft, $Body->clientTop, $Body->clientWidth, $Body->clientHeight );
 }
 
-
 sub CaptureElement {
   my $e = ref $_[0] ? shift : GetElement(shift);
-  my %args = ref $_[0] eq 'HASH' ? %{(shift)} : ();
+  my $args = ProcessArgs(ref $_[0] eq 'HASH' ? shift : {});
   return CapturePage() if $e->tagName eq 'BODY';
 
   GetDoc();
 
-  $args{border_left} = exists $args{border_left} ? exists $args{border_left} : exists $args{border} ? $args{border} : $CaptureBorder;
-  $args{border_right} = exists $args{border_right} ? exists $args{border_right} : exists $args{border} ? $args{border} : $CaptureBorder;
-  $args{border_top} = exists $args{border_top} ? exists $args{border_top} : exists $args{border} ? $args{border} : $CaptureBorder;
-  $args{border_bottom} = exists $args{border_bottom} ? exists $args{border_bottom} : exists $args{border} ? $args{border} : $CaptureBorder;
-
   my ($px, $py, $sx, $sy, $w, $h);
 
-  # Scrolls the object so that top of the object is visible at the top of the window.
-  $e->scrollIntoView();
-
-  # This is the size of the object including border
+  # This is the size of the object including its border
   $w = $e->offsetWidth;
   $h = $e->offsetHeight;
 
@@ -192,25 +206,64 @@ sub CaptureElement {
     $p = $p->offsetParent;
   }
 
-  $px -= ($args{border_left}||0);
-  $py -= ($args{border_top}||0);
-  $w  += ($args{border_left}||0) + ($args{border_right}||0);
-  $h  += ($args{border_top}||0) + ($args{border_bottom}||0);
+  # Expand the area by capture border
+  $px -= ($args->{border_left}||0);
+  $py -= ($args->{border_top}||0);
+  $w  += ($args->{border_left}||0) + ($args->{border_right}||0);
+  $h  += ($args->{border_top}||0) + ($args->{border_bottom}||0);
 
-  # The position on the screen is different due to page scrolling and Body border
-  $sx = $px - $Body->scrollLeft + $Body->clientLeft;
-  $sy = $py - $Body->scrollTop + $Body->clientTop;
+  return CaptureArea($px, $py, $w, $h);
+}
 
-  if ( $sx+$w < $Body->clientWidth && $sy+$h < $Body->clientHeight ) {
+sub ProcessArgs {
+  my $a = shift;
+  my %args;
 
-    # If the whole object is visible
-    return CaptureWindowRect($HWND_Browser, $sx, $sy, $w, $h );
+  $args{border_left} =   exists $a->{border_left}   ? $a->{border_left}   : exists $a->{border} ? $a->{border} : $CaptureBorder;
+  $args{border_right} =  exists $a->{border_right}  ? $a->{border_right}  : exists $a->{border} ? $a->{border} : $CaptureBorder;
+  $args{border_top} =    exists $a->{border_top}    ? $a->{border_top}    : exists $a->{border} ? $a->{border} : $CaptureBorder;
+  $args{border_bottom} = exists $a->{border_bottom} ? $a->{border_bottom} : exists $a->{border} ? $a->{border} : $CaptureBorder;
+  return \%args;
+}
 
-  } else {
+sub CaptureElements {
+  my @elements = map { ! ref $_ ? GetElement($_) : $_ } grep { ! ref $_ || ref $_ eq 'Win32::OLE' } @_;
+  my $args = ProcessArgs(ref $_[-1] eq 'HASH' ? $_[-1] : {});
 
-    # If only part of it is visible
-    return CaptureAndScroll($e, $px, $py, $w, $h);
+  my ($tlx, $tly, $brx, $bry);
+  my ($px, $py, $sx, $sy, $w, $h);
+
+  GetDoc();
+
+  # calculate absolute position on the page for all elements
+  # and get bounding rect
+  for my $e ( @elements ) {
+    my $p = $e;
+
+    my ($x, $y) = (0, 0);
+    while ( $p ) {
+      $x += $p->offsetLeft;
+      $y += $p->offsetTop;
+      $p = $p->offsetParent;
+    }
+
+    $tlx = $x if !defined $tlx || $tlx > $x;
+    $tly = $y if !defined $tly || $tly > $y;
+    $brx = $x+$e->offsetWidth if !defined $brx || $brx < $x+$e->offsetWidth;
+    $bry = $y+$e->offsetHeight if !defined $bry || $bry < $y+$e->offsetHeight;
   }
+
+  $w = $brx - $tlx + 1;
+  $h = $bry - $tly + 1;
+  $px = $tlx;
+  $py = $tly;
+
+  $px -= ($args->{border_left}||0);
+  $py -= ($args->{border_top}||0);
+  $w  += ($args->{border_left}||0) + ($args->{border_right}||0);
+  $h  += ($args->{border_top}||0) + ($args->{border_bottom}||0);
+
+  return CaptureArea($px, $py, $w, $h);
 }
 
 sub CapturePage {
@@ -218,16 +271,21 @@ sub CapturePage {
 
   GetDoc();
 
-  # Scrolls the object so that top of the object is visible at the top of the window.
-  $Body->doScroll('pageUp') while $Body->scrollTop > 0;
-  $Body->doScroll('pageLeft') while $Body->scrollLeft > 0;
+  return CaptureArea(0, 0, $Body->scrollWidth, $Body->scrollHeight);
+}
 
-  # This is the size of the page content
-  $w = $Body->scrollWidth;
-  $h = $Body->scrollHeight;
+sub CaptureArea($$$$) {
+  my ($px, $py, $w, $h) = @_;
+  my ($sx, $sy);
 
-  # Postion is [0,0]
-  $px = 0; $py = 0;
+  $px = 0 if $px < 0;
+  $py = 0 if $py < 0;
+  $w = $Body->{scrollWidth}-$px if $px+$w > $Body->{scrollWidth};
+  $h = $Body->{scrollHeight}-$py if $py+$h > $Body->{scrollHeight};
+
+  # Scrolls the page so that top of the object is visible at the top of the window.
+  $Body->{scrollTop} = $py - 2;
+  $Body->{scrollLeft} = $px - 2;
 
   # The position on the screen is different due to page scrolling and Body border
   $sx = $px - $Body->scrollLeft + $Body->clientLeft;
@@ -241,36 +299,30 @@ sub CapturePage {
   } else {
 
     # If only part of it is visible
-    return CaptureAndScroll(undef, $px, $py, $w, $h);
+    return CaptureAndScroll($px, $py, $w, $h);
   }
 }
 
-sub CaptureAndScroll {
-  my ($e, $px, $py, $w, $h) = @_;
+sub CaptureAndScroll ($$$$) {
+  my ($px, $py, $w, $h) = @_;
   my ($strip, $final, $pw, $ph, $ch, $cw, $maxw, $maxh, $sx, $sy);
 
   GetDoc();
 
-  $final = '';
-
   # Captured area
+  $final = '';
   $cw = 0;
   $ch = 0;
 
-  # We will do the screen capturing in more steps by areas of maximum dimensions $cw x $ch
+  # We will do the screen capturing in more steps by areas of maximum dimensions $maxw x $maxh
   $maxw = $Body->clientWidth;
   $maxh = $Body->clientHeight;
 
   for ( my $cnt_x=0 ; $cw < $w ; $cnt_x++ ) {
 
-    # Scroll to the top and one right
-    if ( $e ) {
-      $e->scrollIntoView;
-      $Body->doScroll('pageRight') for 1..$cnt_x;
-    } else {
-      $Body->doScroll('pageUp') while $Body->scrollTop > 0;
-      $Body->doScroll('pageRight') if $cnt_x;
-    }
+    # Scroll to the top and right
+    $Body->{scrollTop} = $px - 2;
+    $Body->{scrollLeft} = $px - 2 + $cnt_x * int($maxw*0.9);
     Win32::OLE->SpinMessageLoop;
 
     $strip = '';
@@ -278,7 +330,8 @@ sub CaptureAndScroll {
 
     for ( my $cnt_y=0 ; $ch < $h ; $cnt_y++ ) {
 
-      $Body->doScroll('pageDown') if $cnt_y;
+      $Body->{scrollTop} = $px - 2 + $cnt_y * int($maxh*0.9);
+      Win32::OLE->SpinMessageLoop;
 
       # Recalculate the position on the screen
       $sx = $px - $Body->scrollLeft + $Body->clientLeft + $cw;
@@ -369,12 +422,15 @@ screenshots and glue the parts together.
 
 =item :default
 
+C<CaptureArea>
 C<CaptureBrowser>
 C<CaptureElement>
-C<CaptureRows>
+C<CaptureElements>
 C<CapturePage>
+C<CaptureRows>
 C<CaptureThumbshot>
 C<GetDoc>
+C<GetAll>
 C<GetElement>
 C<Navigate>
 C<QuitIE>
@@ -401,11 +457,13 @@ You can specify width and height of the window as parameters.
   StartIE( width => 808, height => 600 );
 
 The function will bring the window to the top and try to locate the
-child window where the page is rendered.
+child window where the page is rendered. The mouse cursor will be moved
+to the top left corner of the screen to not interfere with the browser.
 
 =item QuitIE ( )
 
-Terminates the Internet Explorer process and destroys the Win32::OLE object.
+Terminates the Internet Explorer process and destroys the Win32::OLE
+object. Restores the original cursor position.
 
 =item Navigate ( $url )
 
@@ -420,6 +478,12 @@ Refreshes the currently loaded page and calls C<GetDoc> function.
 
 Loads C<$Doc> and C<$Body> global variables.
 
+=item GetAll ( $tagName [, $index ] )
+
+Returns the list of objects of specified tag name or N-th object from the
+list if $index is specified. The first element in the list has indx 0. The
+list is composed from C<< document->all >> collection.
+
 =item GetElement ( $id )
 
 Returns the object of specified ID by calling C<< document->getElementById() >>.
@@ -432,17 +496,16 @@ These function works like other C<Capture*(...)> functions from L<Win32::Screens
 
 =over 8
 
+=item CaptureArea ( $px, $py, $w, $h )
+
+Capture selected area on page. The coordinates are relative to the tole
+left corner of the page. If the area is larger than the window the function
+will capture the whole area step by step by scrolling the window content
+(in all directions) and will return a complete image of the page.
+
 =item CaptureBrowser ( )
 
 Captures whole Internet Explorer window including the window title and border.
-
-=item CapturePage ( )
-
-Captures whole page currently loaded in the Internet Explorer window. Only the page content will
-be captured - no window, no scrollbars. If the page is smaller than the window only the occupied
-part of the window will be captured. If the page is longer (scrollbars are active) the function
-will capture the whole page step by step by scrolling the window content (in all directions) and
-will return a complete image of the page.
 
 =item CaptureElement ( $id | $element [, \%args ] )
 
@@ -455,6 +518,19 @@ It can capture a small surrounding area around the element specified
 by %args hash or C<$CaptureBorder> global variable. It recognizes paramters
 C<border>, C<border-left>, C<border-top>, C<border-right> and C<border-bottom>.
 The priority is C<border-*> -> C<border> -> C<$CaptureBorder>.
+
+=item CaptureElements ( $id1 | $element1, $id2 | $element2, ... [, \%args ] )
+
+Captures all selected elements. The function captures the outter bounding
+box of all elements in the same way as CaptureElement captures only one.
+
+=item CapturePage ( )
+
+Captures whole page currently loaded in the Internet Explorer window. Only the page content will
+be captured - no window, no scrollbars. If the page is smaller than the window only the occupied
+part of the window will be captured. If the page is longer (scrollbars are active) the function
+will capture the whole page step by step by scrolling the window content (in all directions) and
+will return a complete image of the page.
 
 =item CaptureRows ( $id | $element , @rows )
 
@@ -515,7 +591,33 @@ convert page coordinates to screen coordinates.
 
 =back
 
+=head1 TIPS
+
+=over 8
+
+=item Calling JavaScript functions
+
+If you need to call a JavaScript function to get to anoter page or submit the form
+you can just use Navigate. Note that C<Win32::CaptureIE::Navigate()> waits for page
+load complete but C<< $IE->Navigate() >> do not.
+
+  Navigate("javascript:form_submit('approve');");
+
+=item Capturing only a part of element
+
+To capture only a part of the element set the border to negative values. But do not
+overdraw it, you still have to have something to capture.
+
+  # capture messages between the toolbar and the 1st fieldset
+  $img = CaptureElements('toolbar', GetAll('FIELDSET', 0),
+    { border_top => -12, border_bottom => -64 }
+  );
+
+=back
+
 =head1 SEE ALSO
+
+=over 8
 
 =item MSDN
 
@@ -526,6 +628,8 @@ of InternetExplorer object and DOM.
 
 This package is used for capturing screenshots. Use its post-processing
 features for automatic screenshot modification.
+
+=back
 
 =head1 AUTHOR
 
