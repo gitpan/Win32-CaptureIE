@@ -8,3 +8,6 @@ Revision history for Perl extension Win32::CaptureIE.
         - new: CaptureRows function
         - new: CaptureThumbshot function
         - new: advanced customization of border for CaptureElement function
+
+1.11  Mon Feb 23 11:29:47 2004
+        - fix: solution for HTML vs. BODY concept in IE6 if DOCTYPE is specified

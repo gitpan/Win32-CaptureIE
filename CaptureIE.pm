@@ -36,7 +36,7 @@ our @EXPORT_OK = ( @{ $EXPORT_TAGS{'all'} } );
 
 our @EXPORT = @{ $EXPORT_TAGS{'default'} };
 
-our $VERSION = '1.10';
+our $VERSION = '1.11';
 our $IE;
 our $HWND_IE;
 our $HWND_Browser;
@@ -112,7 +112,7 @@ sub Refresh () {
 
 sub GetDoc () {
   $Doc = $IE->{Document};
-  $Body = $Doc->{Body};
+  $Body = (! $Doc->compatMode || $Doc->compatMode eq 'BackCompat') ? $Doc->{Body} : $Doc->{Body}->{parentNode};
 }
 
 sub GetElement ($) {
@@ -147,6 +147,8 @@ sub CaptureRows {
 
 sub CaptureThumbshot {
 
+  GetDoc();
+
   # resize the window to set the client area to 800x600
   $IE->{width} = $IE->{width} + 800-$Body->clientWidth;
   $IE->{height} = $IE->{height} + 600-$Body->clientHeight;
@@ -154,6 +156,8 @@ sub CaptureThumbshot {
   # scrollTo(0, 0)
   $Body->doScroll('pageUp') while $Body->scrollTop > 0;
   $Body->doScroll('pageLeft') while $Body->scrollLeft > 0;
+
+  Win32::OLE->SpinMessageLoop();
 
   return CaptureWindowRect($HWND_Browser, $Body->clientLeft, $Body->clientTop, $Body->clientWidth, $Body->clientHeight );
 }
@@ -163,6 +167,8 @@ sub CaptureElement {
   my $e = ref $_[0] ? shift : GetElement(shift);
   my %args = ref $_[0] eq 'HASH' ? %{(shift)} : ();
   return CapturePage() if $e->tagName eq 'BODY';
+
+  GetDoc();
 
   $args{border_left} = exists $args{border_left} ? exists $args{border_left} : exists $args{border} ? $args{border} : $CaptureBorder;
   $args{border_right} = exists $args{border_right} ? exists $args{border_right} : exists $args{border} ? $args{border} : $CaptureBorder;
@@ -210,6 +216,8 @@ sub CaptureElement {
 sub CapturePage {
   my ($px, $py, $sx, $sy, $w, $h);
 
+  GetDoc();
+
   # Scrolls the object so that top of the object is visible at the top of the window.
   $Body->doScroll('pageUp') while $Body->scrollTop > 0;
   $Body->doScroll('pageLeft') while $Body->scrollLeft > 0;
@@ -241,6 +249,8 @@ sub CaptureAndScroll {
   my ($e, $px, $py, $w, $h) = @_;
   my ($strip, $final, $pw, $ph, $ch, $cw, $maxw, $maxh, $sx, $sy);
 
+  GetDoc();
+
   $final = '';
 
   # Captured area
@@ -261,6 +271,7 @@ sub CaptureAndScroll {
       $Body->doScroll('pageUp') while $Body->scrollTop > 0;
       $Body->doScroll('pageRight') if $cnt_x;
     }
+    Win32::OLE->SpinMessageLoop;
 
     $strip = '';
     $ch = 0;
@@ -296,6 +307,8 @@ sub CaptureAndScroll {
 
 
 sub CaptureBrowser {
+
+  GetDoc();
 
   # scrollTo(0, 0)
   $Body->doScroll('pageUp') while $Body->scrollTop > 0;
