@@ -18,3 +18,8 @@ Revision history for Perl extension Win32::CaptureIE.
         - new: CaptureArea function
         - new: CaptureElements function
         - new: moves cursor to [0,0] position in StartIE function and restores in back in QuitIE
+
+1.30  Mon Mar  4 09:09:00 2004
+        - new: RunJS function
+        - new: Wait function
+        - new: PopUp function and popup window handling

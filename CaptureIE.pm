@@ -12,6 +12,9 @@ our %EXPORT_TAGS = ( 'default' => [ qw(
   StartIE
   QuitIE
   Navigate
+  PopUp
+  RunJS
+  Wait
   Refresh
   GetElement
   GetAll
@@ -31,6 +34,9 @@ our %EXPORT_TAGS = ( 'default' => [ qw(
   $HWND_IE
   $HWND_Browser
   $CaptureBorder
+  $PopUp_IE
+  $PopUp_HWND_IE
+  $PopUp_HWND_Browser
 ) ] );
 
 $EXPORT_TAGS{all} = [ map {@$_} values %EXPORT_TAGS ];
@@ -39,17 +45,18 @@ our @EXPORT_OK = ( @{ $EXPORT_TAGS{'all'} } );
 
 our @EXPORT = @{ $EXPORT_TAGS{'default'} };
 
-our $VERSION = '1.20';
+our $VERSION = '1.30';
 our $IE;
 our $HWND_IE;
 our $HWND_Browser;
 our $Doc;
 our $Body;
-our ($MOUSE_x, $MOUSE_y);
-
+our $PopUp_IE;
+our $PopUp_HWND_IE;
+our $PopUp_HWND_Browser;
+our $ProcessPopUps = 0;
 our $CaptureBorder = 1;
-
-# Preloaded methods go here.
+our ($MOUSE_x, $MOUSE_y);
 
 use Win32::OLE qw(in valof EVENTS);
 use Win32::Screenshot qw(:all);
@@ -107,9 +114,45 @@ sub QuitIE () {
 }
 
 sub Navigate ($) {
-  $IE->Navigate($_[0]);
+  (defined $PopUp_IE ? $PopUp_IE : $IE)->Navigate($_[0]);
   Win32::OLE->MessageLoop();
   GetDoc();
+}
+
+sub PopUp (&) {
+  $ProcessPopUps = 1;
+  &{$_[0]}();
+  Win32::OLE->MessageLoop();
+  GetDoc();
+
+  # Find the largest child window, suppose that this is the area where the page is rendered
+  $PopUp_HWND_IE = $PopUp_IE->{HWND};
+  my ($sz, $i) = (0, 0);
+  for ( ListChilds($PopUp_HWND_IE) ) {
+    next unless $_->{visible};
+    if ( $sz < (($_->{rect}[2]-$_->{rect}[0])*($_->{rect}[3]-$_->{rect}[1])) ) {
+      $sz = (($_->{rect}[2]-$_->{rect}[0])*($_->{rect}[3]-$_->{rect}[1]));
+      $i = $_->{hwnd};
+    }
+  }
+  $PopUp_HWND_Browser = $i;
+
+  $ProcessPopUps = 0;
+}
+
+sub RunJS ($) {
+  (defined $PopUp_IE ? $PopUp_IE : $IE)->Navigate("javascript:$_[0]");
+  Wait(1);
+  GetDoc();
+}
+
+sub Wait (;$) {
+  my $time = shift || 1;
+  while ( $time > 0 ) {
+    Win32::OLE->SpinMessageLoop;
+    select undef, undef, undef, 0.1;
+    $time -= 0.1;
+  }
 }
 
 sub Refresh () {
@@ -120,7 +163,7 @@ sub Refresh () {
 }
 
 sub GetDoc () {
-  $Doc = $IE->{Document};
+  $Doc = defined $PopUp_IE ? $PopUp_IE->{Document} : $IE->{Document};
   $Body = (! $Doc->compatMode || $Doc->compatMode eq 'BackCompat') ? $Doc->{Body} : $Doc->{Body}->{parentNode};
 }
 
@@ -128,13 +171,16 @@ sub GetElement ($) {
   return $Doc->getElementById($_[0]);
 }
 
-sub GetAll ($;$) {
+sub GetAll ($;$$) {
   my $tag = uc shift;
+  my $sub = ref $_[0] eq 'CODE' ? shift : undef;
   my $idx = shift;
   my @elements;
 
+  local $_;
   for ( my $i = 0 ; $i < $Doc->All->length ; $i++ ) {
-    push @elements, $Doc->All($i) if $Doc->All($i)->tagName eq $tag;
+    $_ = $Doc->All($i);
+    push @elements, $_ if $_->tagName eq $tag && (!defined $sub || &$sub( $_ ));
     last if defined $idx && @elements > $idx;
   }
 
@@ -170,6 +216,9 @@ sub CaptureRows {
 }
 
 sub CaptureThumbshot {
+
+  # that's not a good idea to capture thumbshots of popup windows
+  return if defined $PopUp_IE;
 
   GetDoc();
 
@@ -274,7 +323,7 @@ sub CapturePage {
   return CaptureArea(0, 0, $Body->scrollWidth, $Body->scrollHeight);
 }
 
-sub CaptureArea($$$$) {
+sub CaptureArea ($$$$) {
   my ($px, $py, $w, $h) = @_;
   my ($sx, $sy);
 
@@ -294,7 +343,7 @@ sub CaptureArea($$$$) {
   if ( $sx+$w < $Body->clientWidth && $sy+$h < $Body->clientHeight ) {
 
     # If the whole object is visible
-    return CaptureWindowRect($HWND_Browser, $sx, $sy, $w, $h );
+    return CaptureWindowRect(defined $PopUp_IE ? $PopUp_HWND_Browser : $HWND_Browser, $sx, $sy, $w, $h );
 
   } else {
 
@@ -345,7 +394,7 @@ sub CaptureAndScroll ($$$$) {
       $ph = $ch + $ph > $h ? $h - $ch : $ph;
 
       # Capture the part and append it to the strip
-      $strip .= (CaptureHwndRect($HWND_Browser, $sx, $sy, $pw, $ph))[2];
+      $strip .= (CaptureHwndRect(defined $PopUp_IE ? $PopUp_HWND_Browser : $HWND_Browser, $sx, $sy, $pw, $ph))[2];
 
       $ch += $ph;
     }
@@ -367,7 +416,7 @@ sub CaptureBrowser {
   $Body->doScroll('pageUp') while $Body->scrollTop > 0;
   $Body->doScroll('pageLeft') while $Body->scrollLeft > 0;
 
-  return CaptureWindow( $HWND_IE );
+  return CaptureWindow( defined $PopUp_IE ? $PopUp_HWND_IE : $HWND_IE );
 }
 
 ##########################################################################
@@ -375,14 +424,66 @@ sub CaptureBrowser {
 sub EventHandler {
   my ($obj,$event,@args) = @_;
 
+  # if the document is fully loaded and ready after Navigate()
   if ($event eq 'DocumentComplete' && $IE->ReadyState() == 4)  {
     Win32::OLE->QuitMessageLoop;
   }
 
+  # if the document is fully loaded and ready after Refresh()
   if ($event eq 'DownloadComplete' && $refreshing_page) {
     $refreshing_page = 0;
     Win32::OLE->QuitMessageLoop;
   }
+
+  # if new window is going to be created
+  if ($event eq 'NewWindow2') {
+
+    # if we want to process popups and don't have any yet
+    if ( $ProcessPopUps && ! $PopUp_IE ) {
+
+      # create a browser for the window
+      $PopUp_IE = Win32::OLE->new("InternetExplorer.Application")->{Application};
+      Win32::OLE->WithEvents($PopUp_IE, \&PopUpEventHandler, "DWebBrowserEvents2");
+      $args[0]->Put($PopUp_IE);
+
+      # wait while the window is busy
+      while ($PopUp_IE->{Busy} == 1) { select(undef, undef, undef, 0.2); }
+
+    # if we do not want any popups, cancel that
+    } else {
+      $args[1]->Put(1);
+    }
+
+  }
+}
+
+
+sub PopUpEventHandler {
+  my ($obj,$event,@args) = @_;
+
+  # if the document is fully loaded and ready after Navigate()
+  if ($event eq 'DocumentComplete' && $IE->ReadyState() == 4)  {
+    Win32::OLE->QuitMessageLoop;
+  }
+
+  # if the document is fully loaded and ready after Refresh()
+  if ($event eq 'DownloadComplete' && $refreshing_page) {
+    $refreshing_page = 0;
+    Win32::OLE->QuitMessageLoop;
+  }
+
+  # if new window is going to be created, cancel that, we can handle only one popup
+  if ($event eq 'NewWindow2') {
+    $args[1]->Put(1);
+  }
+
+  # if the window has been closed destroy the object
+  if ($event eq 'OnQuit') {
+    $PopUp_IE = undef;
+    $PopUp_HWND_IE = undef;
+    $PopUp_HWND_Browser = undef;
+  }
+
 }
 
 ##########################################################################
@@ -433,6 +534,9 @@ C<GetDoc>
 C<GetAll>
 C<GetElement>
 C<Navigate>
+C<RunJS>
+C<PopUp>
+C<Wait>
 C<QuitIE>
 C<Refresh>
 C<StartIE>
@@ -442,6 +546,9 @@ C<$Doc>
 C<$HWND_Browser>
 C<$HWND_IE>
 C<$IE>
+C<$PopUp_HWND_Browser>
+C<$PopUp_HWND_IE>
+C<$PopUp_IE>
 
 =back
 
@@ -470,6 +577,22 @@ object. Restores the original cursor position.
 Loads the specified page and waits until the page is completely loaded. Then it will
 call C<GetDoc> function.
 
+=item RunJS ( $script )
+
+Runs the specified JavaScript code in the browser and waits for 1 second.
+
+=item PopUp ( \$code )
+
+Opens popup window by calling the code and redirects all other functions
+to that popup.
+
+See chapter L<PopUp Handling|PopUp Handling> for more info.
+
+=item Wait ( [$seconds] )
+
+Waits for specified time (default 1 second) while calling C<< Win32::OLE->SpinMessageLoop >>
+to let IE to process the requests.
+
 =item Refresh ( )
 
 Refreshes the currently loaded page and calls C<GetDoc> function.
@@ -478,11 +601,18 @@ Refreshes the currently loaded page and calls C<GetDoc> function.
 
 Loads C<$Doc> and C<$Body> global variables.
 
-=item GetAll ( $tagName [, $index ] )
+=item GetAll ( $tagName [, \$code [, $index ]] )
 
 Returns the list of objects of specified tag name or N-th object from the
 list if $index is specified. The first element in the list has indx 0. The
 list is composed from C<< document->all >> collection.
+
+If you specify a code ref it will be used to limit the list in the same way
+grep does it.
+
+  # get 3rd span element with class=label
+  my $label = GetAll('SPAN', sub {$_->{className} eq 'label'}, 2 );
+
 
 =item GetElement ( $id )
 
@@ -589,6 +719,12 @@ The function C<StartIE> will try to find the largest child window and
 suppose that this is the area where is the page rendered. It is used to
 convert page coordinates to screen coordinates.
 
+=item $PopUp_IE, $PopUp_HWND_IE, $PopUp_HWND_Browser
+
+These variables has similar meaning as their namesakes but are related
+to the popup window. If $PopUp_IE is defined than all functions use it
+instead of $IE.
+
 =back
 
 =head1 TIPS
@@ -603,6 +739,10 @@ load complete but C<< $IE->Navigate() >> do not.
 
   Navigate("javascript:form_submit('approve');");
 
+If you need to wait for a while after the call use C<RunJS()> function.
+
+  RunJS("form_del();");
+
 =item Capturing only a part of element
 
 To capture only a part of the element set the border to negative values. But do not
@@ -613,7 +753,43 @@ overdraw it, you still have to have something to capture.
     { border_top => -12, border_bottom => -64 }
   );
 
+=item Process execution suspending
+
+If you need to make the program sleep for a while do not use in-build C<sleep()> function.
+Use C<Wait> instead. It will periodically call C<< Win32::OLE->SpinMessageLoop >>
+to process any signals comming from OLE interface.
+
+  # wait 2 seconds
+  Wait( 2 );
+
 =back
+
+=head2 PopUp Handling
+
+The package can handle capturing of popup window. Only one at a time and you have to spawn the window
+by using C<PopUp> function. Any new window creation requests are denied by default! You shouldn't be
+bothered by popups you don't want.
+
+  # get an element named 'clickme'
+  my $button = GetElement('clickme');
+
+  # create the popup window by clicking on the 'Click Me' button
+  PopUp { $button->click(); };
+
+  # let's capture the content of the popup window
+  CapturePage()->Write('popup.png');
+
+  # let's capture the element on the popup window
+  CaptureElement('inputline')->Write('popup-inline.png');
+
+  # let's do any other business with the popup window
+  ...
+
+  # done, shut it
+  RunJS("window.close();");
+
+  # capturing is redirected back to the main window
+  CapturePage()->Write('main.png');
 
 =head1 SEE ALSO
 
